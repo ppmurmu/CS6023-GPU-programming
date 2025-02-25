@@ -14,9 +14,61 @@ typedef long long ll;
 
 __global__ void dkernel(long int *matrix, long int *filter, long int *result, int h, int w, int c, int r, int s, int k)
 {
-    // sample kernel you can use your own kernel
-}
+    // Shared memory for input matrix and filter
+    extern __shared__ long int shared_mem[];
+    long int *shared_matrix = shared_mem;
+    long int *shared_filter = shared_mem + (blockDim.y + r - 1) * (blockDim.x + s - 1);
 
+    // Thread indices
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+
+    // Global indices
+    int x = bx * blockDim.x + tx;
+    int y = by * blockDim.y + ty;
+
+    // Load input matrix into shared memory with padding
+    for (int ch = 0; ch < c; ++ch)
+    {
+        if (x < w && y < h)
+        {
+            shared_matrix[ty * (blockDim.x + s - 1) + tx] = matrix[ch * h * w + y * w + x];
+        }
+        else
+        {
+            shared_matrix[ty * (blockDim.x + s - 1) + tx] = 0; // Zero-padding
+        }
+    }
+
+    __syncthreads();
+
+    // Perform convolution for each filter
+    for (int f = 0; f < k; ++f)
+    {
+        if (x < w && y < h)
+        {
+            long int sum = 0;
+
+            // Apply filter
+            for (int i = 0; i < r; ++i)
+            {
+                for (int j = 0; j < s; ++j)
+                {
+                    for (int ch = 0; ch < c; ++ch)
+                    {
+                        sum += shared_matrix[(ty + i) * (blockDim.x + s - 1) + (tx + j)] *
+                               filter[f * c * r * s + ch * r * s + i * s + j];
+                    }
+                }
+            }
+
+            // Store result in global memory
+            result[f * h * w + y * w + x] = sum;
+        }
+    }
+}
 int main(int argc, char **argv)
 {
     int h, w, c;
