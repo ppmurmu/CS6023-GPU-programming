@@ -17,7 +17,6 @@ struct Edge
 
 void adjustEdgeWeights(vector<Edge> &edges)
 {
-    cout << "adjust weights---";
     for (auto &edge : edges)
     {
         if (edge.type == "green")
@@ -176,6 +175,7 @@ int main(int argc, char **argv)
 
     //--------------TIMER ends
     auto end = chrono::high_resolution_clock::now();
+
     chrono::duration<double> elapsed1 = end - start;
 
     // Check for errors
@@ -198,5 +198,29 @@ int main(int argc, char **argv)
     cudaFree(d_minEdgeIdx);
     cudaFree(d_minEdgeWeight);
 
+    std::ofstream file("cuda.out");
+    if (file.is_open())
+    {
+        file << h_mstWeight;
+        file << "\n";
+        file.close();
+    }
+    else
+    {
+        std::cout << "Unable to open file";
+    }
+
+    std::ofstream file2("cuda_timing.out");
+    if (file2.is_open())
+    {
+        file2 << elapsed1.count() << "\n";
+        file2.close();
+    }
+    else
+    {
+        std::cout << "Unable to open file";
+    }
+
+    return 0;
     return 0;
 }
