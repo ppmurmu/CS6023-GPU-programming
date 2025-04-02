@@ -13,11 +13,40 @@ const int MOD = 1000000007;
 struct Edge
 {
     int src, dest, weight;
-    int factor; // Terrain factor multiplier
+    string type; // Terrain type
+};
+
+void adjustEdgeWeights(vector<Edge> &edges)
+{
+    for (auto &edge : edges)
+    {
+        if (edge.type == "green")
+        {
+            edge.weight = (edge.weight * 2) % MOD;
+        }
+        else if (edge.type == "traffic")
+        {
+            edge.weight = (edge.weight * 5) % MOD;
+        }
+        else if (edge.type == "dept")
+        {
+            edge.weight = (edge.weight * 3) % MOD;
+        }
+        else
+        {
+            edge.weight = (edge.weight * 1) % MOD;
+        }
+    }
+}
+
+// CUDA kernel-compatible Edge structure (without std::string)
+struct CudaEdge
+{
+    int src, dest, weight;
 };
 
 // Serialized CUDA Kernel for Boruvka's MST Calculation
-__global__ void computeMST(Edge *edges, int *mstWeight, int *component, int *minEdgeIdx, int *minEdgeWeight, int V, int E)
+__global__ void computeMST(CudaEdge *edges, int *mstWeight, int *component, int *minEdgeIdx, int *minEdgeWeight, int V, int E)
 {
     if (threadIdx.x + blockIdx.x * blockDim.x > 0)
         return; // Only single thread executes
@@ -103,41 +132,36 @@ int main(int argc, char **argv)
     // Read input edges
     for (int i = 0; i < E; i++)
     {
-        string type;
-        cin >> edges[i].src >> edges[i].dest >> edges[i].weight >> type;
-
-        // Assign factor based on terrain type
-        if (type == "green")
-            edges[i].factor = 2;
-        else if (type == "traffic")
-            edges[i].factor = 5;
-        else if (type == "dept")
-            edges[i].factor = 3;
-        else
-            edges[i].factor = 1;
+        cin >> edges[i].src >> edges[i].dest >> edges[i].weight >> edges[i].type;
     }
 
     // Adjust weights based on terrain factors
-    for (auto &edge : edges)
+    adjustEdgeWeights(edges);
+
+    // Convert to CUDA-compatible edges
+    vector<CudaEdge> cudaEdges(E);
+    for (int i = 0; i < E; i++)
     {
-        edge.weight = (edge.weight * edge.factor) % MOD;
+        cudaEdges[i].src = edges[i].src;
+        cudaEdges[i].dest = edges[i].dest;
+        cudaEdges[i].weight = edges[i].weight;
     }
 
     // Allocate memory on GPU
-    Edge *d_edges;
+    CudaEdge *d_edges;
     int *d_mstWeight;
     int *d_component;
     int *d_minEdgeIdx;
     int *d_minEdgeWeight;
     int h_mstWeight = 0;
 
-    cudaMalloc(&d_edges, E * sizeof(Edge));
+    cudaMalloc(&d_edges, E * sizeof(CudaEdge));
     cudaMalloc(&d_mstWeight, sizeof(int));
     cudaMalloc(&d_component, V * sizeof(int));
     cudaMalloc(&d_minEdgeIdx, V * sizeof(int));
     cudaMalloc(&d_minEdgeWeight, V * sizeof(int));
 
-    cudaMemcpy(d_edges, edges.data(), E * sizeof(Edge), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_edges, cudaEdges.data(), E * sizeof(CudaEdge), cudaMemcpyHostToDevice);
     cudaMemcpy(d_mstWeight, &h_mstWeight, sizeof(int), cudaMemcpyHostToDevice);
 
     // Set initial values
@@ -203,5 +227,6 @@ int main(int argc, char **argv)
         std::cout << "Unable to open file";
     }
 
+    return 0;
     return 0;
 }
