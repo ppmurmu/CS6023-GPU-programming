@@ -7,7 +7,8 @@
 using namespace std;
 using std::cin;
 using std::cout;
-#define MOD 1000000007
+
+const int MOD = 1000000007;
 
 struct Edge
 {
@@ -21,15 +22,19 @@ void adjustEdgeWeights(vector<Edge> &edges)
     {
         if (edge.type == "green")
         {
-            edge.weight *= 2;
+            edge.weight = (edge.weight * 2) % MOD;
         }
         else if (edge.type == "traffic")
         {
-            edge.weight *= 5;
+            edge.weight = (edge.weight * 5) % MOD;
         }
         else if (edge.type == "dept")
         {
-            edge.weight *= 3;
+            edge.weight = (edge.weight * 3) % MOD;
+        }
+        else
+        {
+            edge.weight = (edge.weight * 1) % MOD;
         }
     }
 }
@@ -109,7 +114,8 @@ __global__ void computeMST(CudaEdge *edges, int *mstWeight, int *component, int 
                             component[j] = compU;
                         }
                     }
-                    *mstWeight += edges[edgeIdx].weight;
+                    *mstWeight = (*mstWeight + edges[edgeIdx].weight) % MOD;
+
                     changed = true;
                 }
             }
@@ -221,6 +227,5 @@ int main(int argc, char **argv)
         std::cout << "Unable to open file";
     }
 
-    return 0;
     return 0;
 }
