@@ -16,6 +16,16 @@ struct Edge
     int factor; // Terrain factor multiplier
 };
 
+// adjust weights kernel
+__global__ void adjustWeights(Edge *edges, int E, int MOD)
+{
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < E)
+    {
+        edges[idx].weight = (edges[idx].weight * edges[idx].factor) % MOD;
+    }
+}
+
 // Serialized CUDA Kernel for Boruvka's MST Calculation
 __global__ void computeMST(Edge *edges, int *mstWeight, int *component, int *minEdgeIdx, int *minEdgeWeight, int V, int E)
 {
@@ -116,12 +126,14 @@ int main(int argc, char **argv)
         else
             edges[i].factor = 1;
     }
+    // //Adjust weights based on terrain factors
+    // for (auto &edge : edges)
+    // {
+    //     edge.weight = (edge.weight * edge.factor) % MOD;
+    // }
 
-    // Adjust weights based on terrain factors
-    for (auto &edge : edges)
-    {
-        edge.weight = (edge.weight * edge.factor) % MOD;
-    }
+    //--------------TIMER-----
+    auto start = chrono::high_resolution_clock::now();
 
     // Allocate memory on GPU
     Edge *d_edges;
@@ -146,19 +158,21 @@ int main(int argc, char **argv)
     cudaMemcpy(d_minEdgeIdx, h_minEdgeIdx.data(), V * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_minEdgeWeight, h_minEdgeWeight.data(), V * sizeof(int), cudaMemcpyHostToDevice);
 
-    //--------------TIMER-----
-    auto start = chrono::high_resolution_clock::now();
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (E + threadsPerBlock - 1) / threadsPerBlock;
+    adjustWeights<<<blocksPerGrid, threadsPerBlock>>>(d_edges, E, MOD);
+    cudaDeviceSynchronize();
 
     // Launch CUDA Kernel (single-threaded execution)
     computeMST<<<1, 1>>>(d_edges, d_mstWeight, d_component, d_minEdgeIdx, d_minEdgeWeight, V, E);
-
-    // Wait for GPU to finish
-    cudaDeviceSynchronize();
 
     //--------------TIMER ends
     auto end = chrono::high_resolution_clock::now();
 
     chrono::duration<double> elapsed1 = end - start;
+
+    // Wait for GPU to finish
+    cudaDeviceSynchronize();
 
     // Check for errors
     cudaError_t err = cudaGetLastError();
@@ -169,9 +183,6 @@ int main(int argc, char **argv)
 
     // Copy result back
     cudaMemcpy(&h_mstWeight, d_mstWeight, sizeof(int), cudaMemcpyDeviceToHost);
-
-    // Print the total MST weight
-    cout << h_mstWeight << endl;
 
     // Free GPU memory
     cudaFree(d_edges);
