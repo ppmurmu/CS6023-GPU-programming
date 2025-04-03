@@ -9,117 +9,108 @@ using std::cin;
 using std::cout;
 
 const int MOD = 1000000007;
+const int INF = -1;
 
 struct Edge
 {
     int src, dest, weight;
-    string type; // Terrain type
+    int factor; // Terrain factor multiplier
 };
 
-void adjustEdgeWeights(vector<Edge> &edges)
+// adjust weights kernel
+__global__ void adjustWeights(Edge *edges, int *adjMatrix, int E, int V, int MOD)
 {
-    for (auto &edge : edges)
-    {
-        if (edge.type == "green")
-        {
-            edge.weight = (edge.weight * 2) % MOD;
-        }
-        else if (edge.type == "traffic")
-        {
-            edge.weight = (edge.weight * 5) % MOD;
-        }
-        else if (edge.type == "dept")
-        {
-            edge.weight = (edge.weight * 3) % MOD;
-        }
-        else
-        {
-            edge.weight = (edge.weight * 1) % MOD;
-        }
-    }
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= E)
+        return;
+
+    int u = edges[i].src;
+    int v = edges[i].dest;
+    int w = edges[i].weight;
+
+    // Adjust weight based on terrain factor
+    int factor = 1;
+    if (edges[i].factor == 2)
+        factor = 2;
+    else if (edges[i].factor == 5)
+        factor = 5;
+    else if (edges[i].factor == 3)
+        factor = 3;
+
+    int adjustedWeight = (w * factor) % MOD;
+
+    // Store adjusted weight in adjacency matrix
+    adjMatrix[u * V + v] = adjustedWeight;
+    adjMatrix[v * V + u] = adjustedWeight; // Undirected graph
 }
 
-// CUDA kernel-compatible Edge structure (without std::string)
-struct CudaEdge
+__global__ void computeMST(int *adjMatrix, int *mstWeight, int *component, int *minEdgeIdx, int *minEdgeWeight, int V, int MOD)
 {
-    int src, dest, weight;
-};
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid >= V)
+        return; // Each thread handles a single vertex
 
-// Serialized CUDA Kernel for Boruvka's MST Calculation
-__global__ void computeMST(CudaEdge *edges, int *mstWeight, int *component, int *minEdgeIdx, int *minEdgeWeight, int V, int E)
-{
-    if (threadIdx.x + blockIdx.x * blockDim.x > 0)
-        return; // Only single thread executes
+    // Initialize components (each vertex starts in its own component)
+    component[tid] = tid;
 
-    // Initialize components
-    for (int i = 0; i < V; i++)
-    {
-        component[i] = i;
-    }
+    __syncthreads();
 
     bool changed;
     do
     {
         changed = false;
 
-        // Reset min edges for each component
-        for (int i = 0; i < V; i++)
+        // Reset min edges for each component (parallelized)
+        minEdgeIdx[tid] = -1;
+        minEdgeWeight[tid] = INT_MAX;
+
+        __syncthreads();
+
+        // Find the minimum outgoing edge for each component (parallelized)
+        for (int v = 0; v < V; v++)
         {
-            minEdgeIdx[i] = -1;
-            minEdgeWeight[i] = INT_MAX;
+            int w = adjMatrix[tid * V + v];
+            if (w != INF)
+            {
+                int compU = component[tid];
+                int compV = component[v];
+
+                if (compU != compV)
+                {
+                    atomicMin(&minEdgeWeight[compU], w);
+                    if (w == minEdgeWeight[compU])
+                        minEdgeIdx[compU] = tid * V + v; // Store edge index
+                }
+            }
         }
 
-        // Find the minimum outgoing edge for each component
-        for (int i = 0; i < E; i++)
-        {
-            int u = edges[i].src;
-            int v = edges[i].dest;
-            int w = edges[i].weight;
+        __syncthreads();
 
+        // Merge components in parallel
+        if (minEdgeIdx[tid] != -1)
+        {
+            int edgeIdx = minEdgeIdx[tid];
+            int u = edgeIdx / V;
+            int v = edgeIdx % V;
             int compU = component[u];
             int compV = component[v];
 
             if (compU != compV)
             {
-                if (w < minEdgeWeight[compU])
+                for (int j = 0; j < V; j++)
                 {
-                    minEdgeWeight[compU] = w;
-                    minEdgeIdx[compU] = i;
-                }
-                if (w < minEdgeWeight[compV])
-                {
-                    minEdgeWeight[compV] = w;
-                    minEdgeIdx[compV] = i;
-                }
-            }
-        }
-
-        // Merge components
-        for (int i = 0; i < V; i++)
-        {
-            if (minEdgeIdx[i] != -1)
-            {
-                int edgeIdx = minEdgeIdx[i];
-                int u = edges[edgeIdx].src;
-                int v = edges[edgeIdx].dest;
-                int compU = component[u];
-                int compV = component[v];
-
-                if (compU != compV)
-                {
-                    for (int j = 0; j < V; j++)
+                    if (component[j] == compV)
                     {
-                        if (component[j] == compV)
-                        {
-                            component[j] = compU;
-                        }
+                        component[j] = compU;
                     }
-                    *mstWeight = (*mstWeight + edges[edgeIdx].weight) % MOD;
-
-                    changed = true;
                 }
+
+                atomicAdd(mstWeight, minEdgeWeight[tid]);
+                atomicExch(&changed, true);
             }
         }
+
+        __syncthreads();
     } while (changed);
 }
 
@@ -132,36 +123,43 @@ int main(int argc, char **argv)
     // Read input edges
     for (int i = 0; i < E; i++)
     {
-        cin >> edges[i].src >> edges[i].dest >> edges[i].weight >> edges[i].type;
-    }
+        string type;
+        cin >> edges[i].src >> edges[i].dest >> edges[i].weight >> type;
 
-    // Adjust weights based on terrain factors
-    adjustEdgeWeights(edges);
-
-    // Convert to CUDA-compatible edges
-    vector<CudaEdge> cudaEdges(E);
-    for (int i = 0; i < E; i++)
-    {
-        cudaEdges[i].src = edges[i].src;
-        cudaEdges[i].dest = edges[i].dest;
-        cudaEdges[i].weight = edges[i].weight;
+        // Assign factor based on terrain type
+        if (type == "green")
+            edges[i].factor = 2;
+        else if (type == "traffic")
+            edges[i].factor = 5;
+        else if (type == "dept")
+            edges[i].factor = 3;
+        else
+            edges[i].factor = 1;
     }
+    // //Adjust weights based on terrain factors
+    // for (auto &edge : edges)
+    // {
+    //     edge.weight = (edge.weight * edge.factor) % MOD;
+    // }
+
+    //--------------TIMER-----
+    auto start = chrono::high_resolution_clock::now();
 
     // Allocate memory on GPU
-    CudaEdge *d_edges;
+    Edge *d_edges;
     int *d_mstWeight;
     int *d_component;
     int *d_minEdgeIdx;
     int *d_minEdgeWeight;
     int h_mstWeight = 0;
 
-    cudaMalloc(&d_edges, E * sizeof(CudaEdge));
+    cudaMalloc(&d_edges, E * sizeof(Edge));
     cudaMalloc(&d_mstWeight, sizeof(int));
     cudaMalloc(&d_component, V * sizeof(int));
     cudaMalloc(&d_minEdgeIdx, V * sizeof(int));
     cudaMalloc(&d_minEdgeWeight, V * sizeof(int));
 
-    cudaMemcpy(d_edges, cudaEdges.data(), E * sizeof(CudaEdge), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_edges, edges.data(), E * sizeof(Edge), cudaMemcpyHostToDevice);
     cudaMemcpy(d_mstWeight, &h_mstWeight, sizeof(int), cudaMemcpyHostToDevice);
 
     // Set initial values
@@ -170,19 +168,31 @@ int main(int argc, char **argv)
     cudaMemcpy(d_minEdgeIdx, h_minEdgeIdx.data(), V * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_minEdgeWeight, h_minEdgeWeight.data(), V * sizeof(int), cudaMemcpyHostToDevice);
 
-    //--------------TIMER-----
-    auto start = chrono::high_resolution_clock::now();
+    int *d_adjMatrix;
+    cudaMalloc(&d_adjMatrix, V * V * sizeof(int));
+    cudaMemset(d_adjMatrix, INF, V * V * sizeof(int)); // Initialize to INF (no edges)
+
+    // adjust weight kernel
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (E + threadsPerBlock - 1) / threadsPerBlock;
+
+    adjustWeights<<<blocksPerGrid, threadsPerBlock>>>(d_edges, d_adjMatrix, E, V, MOD);
+    cudaDeviceSynchronize(); // Ensure all updates are completed before MST
 
     // Launch CUDA Kernel (single-threaded execution)
-    computeMST<<<1, 1>>>(d_edges, d_mstWeight, d_component, d_minEdgeIdx, d_minEdgeWeight, V, E);
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (V + threadsPerBlock - 1) / threadsPerBlock;
 
-    // Wait for GPU to finish
+    computeMST<<<blocksPerGrid, threadsPerBlock>>>(d_adjMatrix, d_mstWeight, d_component, d_minEdgeIdx, d_minEdgeWeight, V, MOD);
     cudaDeviceSynchronize();
 
     //--------------TIMER ends
     auto end = chrono::high_resolution_clock::now();
 
     chrono::duration<double> elapsed1 = end - start;
+
+    // Wait for GPU to finish
+    cudaDeviceSynchronize();
 
     // Check for errors
     cudaError_t err = cudaGetLastError();
@@ -193,9 +203,6 @@ int main(int argc, char **argv)
 
     // Copy result back
     cudaMemcpy(&h_mstWeight, d_mstWeight, sizeof(int), cudaMemcpyDeviceToHost);
-
-    // Print the total MST weight
-    cout << h_mstWeight << endl;
 
     // Free GPU memory
     cudaFree(d_edges);
@@ -227,6 +234,5 @@ int main(int argc, char **argv)
         std::cout << "Unable to open file";
     }
 
-    return 0;
     return 0;
 }
