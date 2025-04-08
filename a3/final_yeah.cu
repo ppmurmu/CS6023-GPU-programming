@@ -4,7 +4,7 @@
 #include <cuda.h>
 #include <chrono>
 #include <fstream>
-#include <climits> // For INT_MAX
+#include <climits>
 using namespace std;
 using std::cin;
 using std::cout;
@@ -14,7 +14,7 @@ const int MOD = 1000000007;
 struct Edge
 {
     int src, dest, weight;
-    int factor; // Terrain factor multiplier
+    int factor; // constraint factor multiplier
 };
 
 // Device function to perform find with path compression in union-find.
@@ -28,13 +28,13 @@ __device__ int find(int *parent, int i)
     return i;
 }
 
-// Kernel to adjust edge weights based on terrain factors.
-__global__ void adjustWeights(Edge *edges, int E, int MOD)
+// Kernel to adjust edge weights based on constraint factors.
+__global__ void adjustWeights(Edge *edges, int E)
 {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < E)
     {
-        edges[idx].weight = (edges[idx].weight * edges[idx].factor) % MOD;
+        edges[idx].weight = (edges[idx].weight * edges[idx].factor);
     }
 }
 
@@ -148,9 +148,6 @@ int main(int argc, char **argv)
             edges[i].factor = 1;
     }
 
-    //--------------TIMER-----
-    auto start = chrono::high_resolution_clock::now();
-
     // Allocate memory on GPU
     Edge *d_edges;
     int *d_mstWeight;
@@ -174,8 +171,10 @@ int main(int argc, char **argv)
     int blocksEdges = (E + threadsPerBlock - 1) / threadsPerBlock;
     int blocksVertices = (V + threadsPerBlock - 1) / threadsPerBlock;
 
-    // Adjust weights based on terrain factors
-    adjustWeights<<<blocksEdges, threadsPerBlock>>>(d_edges, E, MOD);
+    //-------TIMER starts here---------------
+    auto start = chrono::high_resolution_clock::now();
+
+    adjustWeights<<<blocksEdges, threadsPerBlock>>>(d_edges, E);
     cudaDeviceSynchronize();
 
     // Initialize components: each vertex is its own component.
@@ -217,15 +216,19 @@ int main(int argc, char **argv)
         }
     }
 
-    //--------------TIMER ends
+    //--------------TIMER ends----------
+    auto end = chrono::high_resolution_clock::now();
 
     // Copy MST result back to host.
     cudaMemcpy(&h_mstWeight, d_mstWeight, sizeof(int), cudaMemcpyDeviceToHost);
-    auto end = chrono::high_resolution_clock::now();
+
     chrono::duration<double> elapsed1 = end - start;
 
     // Ensure GPU has finished
     cudaDeviceSynchronize();
+
+    h_mstWeight = h_mstWeight % MOD;
+    cout << h_mstWeight << endl;
 
     // Check for errors
     cudaError_t err = cudaGetLastError();

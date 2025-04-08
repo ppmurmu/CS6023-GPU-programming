@@ -10,22 +10,6 @@ using std::cout;
 
 const int MOD = 1000000007;
 
-struct Edge
-{
-    int src, dest, weight;
-    int factor; // Terrain factor multiplier
-};
-
-// adjust weights kernel
-__global__ void adjustWeights(Edge *edges, int E, int MOD)
-{
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < E)
-    {
-        edges[idx].weight = (edges[idx].weight * edges[idx].factor) % MOD;
-    }
-}
-
 int main(int argc, char **argv)
 {
     int V, E;
@@ -82,8 +66,6 @@ int main(int argc, char **argv)
 
     int threadsPerBlock = 256;
     int blocksPerGrid = (E + threadsPerBlock - 1) / threadsPerBlock;
-    adjustWeights<<<blocksPerGrid, threadsPerBlock>>>(d_edges, E, MOD);
-    cudaDeviceSynchronize();
 
     //--- launch kernel to compute MST-----
 
