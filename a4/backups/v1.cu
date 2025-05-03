@@ -10,6 +10,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    //--------------input--------------------------------
     ifstream infile(argv[1]); // Read input file from command-line argument
     if (!infile)
     {
@@ -65,11 +66,15 @@ int main(int argc, char *argv[])
 
     infile.close();
 
+    //-------------------------end of input----------
+
     // set your answer to these variables
     long long *path_size;
     long long **paths;
     long long *num_drops;
     long long ***drops;
+
+    //------------output-----------------
 
     ofstream outfile(argv[2]); // Read input file from command-line argument
     if (!outfile)
