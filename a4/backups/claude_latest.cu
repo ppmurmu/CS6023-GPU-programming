@@ -1,4 +1,3 @@
-// CS24M033 GPU Assignment 4
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -936,6 +935,148 @@ void generateEvacuationPaths(
     }
 }
 
+__global__ void buildAdjacencyListKernel(
+    int *roads,
+    int num_roads,
+    int *adjacencyLengths,        // Output: length of each adjacency list
+    int *adjacencyDestinations,   // Output: flattened destination vertices
+    int *adjacencyLengths_values, // Output: flattened length values
+    int *adjacencyCapacities      // Output: flattened capacity values
+)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < num_roads)
+    {
+        int u = roads[tid * 4];
+        int v = roads[tid * 4 + 1];
+        int length = roads[tid * 4 + 2];
+        int capacity = roads[tid * 4 + 3];
+
+        // Use atomic operations to safely add to adjacency lists
+        int idx_u = atomicAdd(&adjacencyLengths[u], 1);
+        int idx_v = atomicAdd(&adjacencyLengths[v], 1);
+
+        // Store edge data (we're using a CSR-like format)
+        // This approach requires a prefix sum to be calculated first
+        adjacencyDestinations[idx_u] = v;
+        adjacencyLengths_values[idx_u] = length;
+        adjacencyCapacities[idx_u] = capacity;
+
+        adjacencyDestinations[idx_v] = u;
+        adjacencyLengths_values[idx_v] = length;
+        adjacencyCapacities[idx_v] = capacity;
+    }
+}
+
+// Parallel prefix sum for CSR format adjacency list construction
+__global__ void prefixSumKernel(int *adjacencyOffsets, int num_cities)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < num_cities)
+    {
+        // Simple prefix sum - could be optimized with parallel scan algorithms
+        for (int i = 0; i < tid; i++)
+        {
+            adjacencyOffsets[tid] += adjacencyOffsets[i];
+        }
+    }
+}
+
+// Function to parallelize graph construction
+vector<vector<Road>> buildAdjacencyListParallel(int *roads, int num_roads, int num_cities)
+{
+    // Output vector
+    vector<vector<Road>> adjacencyList(num_cities);
+
+    // First, count the number of edges per vertex
+    int *h_edgeCounts = new int[num_cities]();
+
+    for (int i = 0; i < num_roads; i++)
+    {
+        int u = roads[i * 4];
+        int v = roads[i * 4 + 1];
+        h_edgeCounts[u]++;
+        h_edgeCounts[v]++;
+    }
+
+    // Allocate device memory
+    int *d_roads, *d_edgeCounts, *d_edgeOffsets;
+    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_roads, num_roads * 4 * sizeof(int)));
+    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_edgeCounts, num_cities * sizeof(int)));
+    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_edgeOffsets, num_cities * sizeof(int)));
+
+    // Copy data to device
+    CHECK_CUDA_ERROR(cudaMemcpy(d_roads, roads, num_roads * 4 * sizeof(int), cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_edgeCounts, h_edgeCounts, num_cities * sizeof(int), cudaMemcpyHostToDevice));
+
+    // Calculate total number of edges (including bidirectional)
+    int totalEdges = 0;
+    for (int i = 0; i < num_cities; i++)
+    {
+        totalEdges += h_edgeCounts[i];
+    }
+
+    // Allocate edge arrays
+    int *d_destinations, *d_lengths, *d_capacities;
+    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_destinations, totalEdges * sizeof(int)));
+    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_lengths, totalEdges * sizeof(int)));
+    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_capacities, totalEdges * sizeof(int)));
+
+    // For a real implementation, we would use a parallel prefix sum (scan) algorithm
+    // For simplicity, we'll use a simple kernel instead
+    int blockSize = 256;
+    int numBlocks = (num_cities + blockSize - 1) / blockSize;
+    prefixSumKernel<<<numBlocks, blockSize>>>(d_edgeOffsets, num_cities);
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+
+    // Build adjacency list in parallel
+    numBlocks = (num_roads + blockSize - 1) / blockSize;
+    buildAdjacencyListKernel<<<numBlocks, blockSize>>>(
+        d_roads, num_roads, d_edgeCounts, d_destinations, d_lengths, d_capacities);
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+
+    // Copy results back to host
+    int *h_destinations = new int[totalEdges];
+    int *h_lengths = new int[totalEdges];
+    int *h_capacities = new int[totalEdges];
+    int *h_edgeOffsets = new int[num_cities];
+
+    CHECK_CUDA_ERROR(cudaMemcpy(h_destinations, d_destinations, totalEdges * sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK_CUDA_ERROR(cudaMemcpy(h_lengths, d_lengths, totalEdges * sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK_CUDA_ERROR(cudaMemcpy(h_capacities, d_capacities, totalEdges * sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK_CUDA_ERROR(cudaMemcpy(h_edgeOffsets, d_edgeOffsets, num_cities * sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Build the adjacency list structure
+    for (int i = 0; i < num_cities; i++)
+    {
+        int start = (i == 0) ? 0 : h_edgeOffsets[i - 1];
+        int end = h_edgeOffsets[i];
+
+        for (int j = start; j < end; j++)
+        {
+            adjacencyList[i].push_back({h_destinations[j], h_lengths[j], h_capacities[j]});
+        }
+    }
+
+    // Clean up
+    delete[] h_edgeCounts;
+    delete[] h_destinations;
+    delete[] h_lengths;
+    delete[] h_capacities;
+    delete[] h_edgeOffsets;
+
+    CHECK_CUDA_ERROR(cudaFree(d_roads));
+    CHECK_CUDA_ERROR(cudaFree(d_edgeCounts));
+    CHECK_CUDA_ERROR(cudaFree(d_edgeOffsets));
+    CHECK_CUDA_ERROR(cudaFree(d_destinations));
+    CHECK_CUDA_ERROR(cudaFree(d_lengths));
+    CHECK_CUDA_ERROR(cudaFree(d_capacities));
+
+    return adjacencyList;
+}
+
 int main(int argc, char *argv[])
 {
     if (argc < 3)
@@ -1001,17 +1142,8 @@ int main(int argc, char *argv[])
 
     // Build adjacency list from roads array
     vector<vector<Road>> adjacencyList(num_cities);
-    for (int i = 0; i < num_roads; i++)
-    {
-        int u = roads[4 * i];
-        int v = roads[4 * i + 1];
-        int length = roads[4 * i + 2];
-        int capacity = roads[4 * i + 3];
-
-        adjacencyList[u].push_back({v, length, capacity});
-        adjacencyList[v].push_back({u, length, capacity});
-    }
-
+    // launch on CUDA
+    adjacencyList = buildAdjacencyListParallel(roads, num_roads, num_cities);
     // Create shelter capacity map and list
     unordered_map<int, int> shelterCapacity;
     vector<int> shelterCities;

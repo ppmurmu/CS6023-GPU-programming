@@ -1,4 +1,3 @@
-// CS24M033 GPU Assignment 4
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -8,7 +7,6 @@
 #include <cmath>
 #include <unordered_map>
 #include <utility>
-#include <chrono>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
@@ -21,17 +19,6 @@ struct Road
     int length;
     int capacity;
 };
-
-// CUDA error checking
-#define CHECK_CUDA_ERROR(val) check_cuda((val), #val, __FILE__, __LINE__)
-inline void check_cuda(cudaError_t result, const char *func, const char *file, int line)
-{
-    if (result != cudaSuccess)
-    {
-        cerr << "CUDA error: " << cudaGetErrorString(result) << " at " << file << ":" << line << " '" << func << "'" << endl;
-        exit(1);
-    }
-}
 
 // CUDA kernel for initializing distance matrix
 __global__ void initializeDistancesKernel(int *d_distances, int num_cities)
@@ -70,10 +57,14 @@ __device__ int minDistance(int *dist, bool *visited, int num_cities)
 }
 
 // CUDA kernel for Dijkstra's algorithm (multiple sources in parallel)
-__global__ void parallelDijkstraKernel(int *d_graph, int *d_distances, int *d_paths, int num_cities)
+// Process cities in batches to avoid memory issues
+__global__ void batchDijkstraKernel(int *d_graph, int *d_distances, int *d_paths, int num_cities, int start_source, int batch_size)
 {
-    int source = blockIdx.x; // Each block handles one source vertex
+    int local_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local_id >= batch_size)
+        return;
 
+    int source = start_source + local_id;
     if (source >= num_cities)
         return;
 
@@ -124,11 +115,16 @@ __global__ void parallelDijkstraKernel(int *d_graph, int *d_distances, int *d_pa
     delete[] visited;
 }
 
-// Kernel for path reconstruction
-__global__ void pathReconstructionKernel(int *d_paths, int *d_reconstructed_paths, int *d_path_lengths, int num_cities, int max_path_length)
+// First pass to determine path lengths
+__global__ void computePathLengthsKernel(int *d_paths, int *d_path_lengths, int num_cities, int start_source, int batch_size)
 {
-    int source = blockIdx.x;
-    int dest = threadIdx.x;
+    int local_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local_id >= batch_size * num_cities)
+        return;
+
+    int batch_offset = local_id / num_cities;
+    int source = start_source + batch_offset;
+    int dest = local_id % num_cities;
 
     if (source >= num_cities || dest >= num_cities)
         return;
@@ -137,7 +133,6 @@ __global__ void pathReconstructionKernel(int *d_paths, int *d_reconstructed_path
     if (source == dest)
     {
         d_path_lengths[source * num_cities + dest] = 1;
-        d_reconstructed_paths[(source * num_cities + dest) * max_path_length] = source;
         return;
     }
 
@@ -148,52 +143,225 @@ __global__ void pathReconstructionKernel(int *d_paths, int *d_reconstructed_path
         return;
     }
 
-    // Count the path length first
+    // Count the path length by following predecessors
     int length = 0;
     int current = dest;
-    int temp_path[1000]; // Temporary buffer for path
 
-    // Follow predecessors to get path length
     while (current != -1 && current != source)
     {
         length++;
         current = d_paths[source * num_cities + current];
 
-        // Safety check for cycles
-        if (length >= max_path_length - 1)
+        // Safety check for cycles (shouldn't happen with Dijkstra, but just in case)
+        if (length > num_cities)
         {
             d_path_lengths[source * num_cities + dest] = 0; // Mark as invalid path
             return;
         }
     }
 
-    if (current != source)
+    if (current == source)
     {
-        // No valid path
-        d_path_lengths[source * num_cities + dest] = 0;
-        return;
+        d_path_lengths[source * num_cities + dest] = length + 1; // +1 for source
+    }
+    else
+    {
+        d_path_lengths[source * num_cities + dest] = 0; // No valid path
+    }
+}
+
+// Convert adjacency list to compressed sparse row (CSR) format for CUDA
+void convertToCSR(const vector<vector<Road>> &adjacencyList, vector<int> &rowOffsets, vector<int> &colIndices, vector<int> &edgeWeights)
+{
+    int numVertices = adjacencyList.size();
+    rowOffsets.resize(numVertices + 1);
+
+    // Count number of edges and set row offsets
+    rowOffsets[0] = 0;
+    for (int i = 0; i < numVertices; i++)
+    {
+        rowOffsets[i + 1] = rowOffsets[i] + adjacencyList[i].size();
     }
 
-    // Valid path found, record length (including source)
-    length++;
-    d_path_lengths[source * num_cities + dest] = length;
+    // Reserve space for column indices and weights
+    int numEdges = rowOffsets[numVertices];
+    colIndices.resize(numEdges);
+    edgeWeights.resize(numEdges);
 
-    // Now reconstruct the path
-    current = dest;
-    int idx = length - 1;
-
-    temp_path[idx--] = current;
-    while (current != source)
+    // Fill column indices and weights
+    for (int i = 0; i < numVertices; i++)
     {
-        current = d_paths[source * num_cities + current];
-        temp_path[idx--] = current;
+        int offset = rowOffsets[i];
+        for (size_t j = 0; j < adjacencyList[i].size(); j++)
+        {
+            colIndices[offset + j] = adjacencyList[i][j].to;
+            edgeWeights[offset + j] = adjacencyList[i][j].length;
+        }
+    }
+}
+
+// Convert CSR to adjacency matrix for CUDA processing (but only for populated cities and shelters)
+int *createGraphMatrix(const vector<vector<Road>> &adjacencyList, int num_cities)
+{
+    // For large graphs, we'll create a matrix for all cities
+    // but we could optimize this to only include relevant cities
+    int *matrix = new int[num_cities * num_cities];
+
+    // Initialize all to 0 (no connection)
+    memset(matrix, 0, num_cities * num_cities * sizeof(int));
+
+    // Fill in the matrix with road lengths
+    for (int i = 0; i < num_cities; i++)
+    {
+        for (const Road &road : adjacencyList[i])
+        {
+            matrix[i * num_cities + road.to] = road.length;
+        }
     }
 
-    // Copy to output
-    for (int i = 0; i < length; i++)
+    return matrix;
+}
+
+// Compute shortest paths using CUDA - with batched processing to save memory
+void computeShortestPathsCuda(
+    const vector<vector<Road>> &adjacencyList,
+    vector<vector<int>> &distances,
+    vector<vector<vector<int>>> &shortestPaths,
+    int num_cities,
+    const vector<int> &populatedCities,
+    const vector<int> &shelterCities)
+{
+    cout << "Converting adjacency list to matrix..." << endl;
+    // This goes at the start of the computeShortestPathsCuda function
+    // Create graph matrix only for relevant cities to save memory
+    int *graphMatrix = createGraphMatrix(adjacencyList, num_cities);
+
+    // Create flattened arrays for distances and paths
+    int *flatDistances = new int[num_cities * num_cities];
+    int *flatPaths = new int[num_cities * num_cities];
+    int *pathLengths = new int[num_cities * num_cities];
+
+    // Initialize distances and paths on host
+    for (int i = 0; i < num_cities; i++)
     {
-        d_reconstructed_paths[(source * num_cities + dest) * max_path_length + i] = temp_path[i];
+        for (int j = 0; j < num_cities; j++)
+        {
+            if (i == j)
+            {
+                flatDistances[i * num_cities + j] = 0;
+            }
+            else
+            {
+                flatDistances[i * num_cities + j] = INT_MAX;
+            }
+            flatPaths[i * num_cities + j] = -1;
+            pathLengths[i * num_cities + j] = 0;
+        }
     }
+
+    // Device memory
+    int *d_graph, *d_distances, *d_paths, *d_path_lengths;
+
+    // Allocate device memory
+    cudaMalloc((void **)&d_graph, num_cities * num_cities * sizeof(int));
+    cudaMalloc((void **)&d_distances, num_cities * num_cities * sizeof(int));
+    cudaMalloc((void **)&d_paths, num_cities * num_cities * sizeof(int));
+    cudaMalloc((void **)&d_path_lengths, num_cities * num_cities * sizeof(int));
+
+    // Copy graph and initial data to device
+    cudaMemcpy(d_graph, graphMatrix, num_cities * num_cities * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_distances, flatDistances, num_cities * num_cities * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_paths, flatPaths, num_cities * num_cities * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Process in batches to avoid memory issues
+    const int BATCH_SIZE = 64; // Adjust based on available GPU memory
+
+    for (int start_source = 0; start_source < num_cities; start_source += BATCH_SIZE)
+    {
+        int current_batch_size = min(BATCH_SIZE, num_cities - start_source);
+
+        // Launch Dijkstra kernel for a batch of sources
+        int threadsPerBlock = 256;
+        int numBlocks = (current_batch_size + threadsPerBlock - 1) / threadsPerBlock;
+
+        batchDijkstraKernel<<<numBlocks, threadsPerBlock>>>(d_graph, d_distances, d_paths, num_cities, start_source, current_batch_size);
+        cudaDeviceSynchronize();
+
+        // Compute path lengths for the batch
+        int totalThreads = current_batch_size * num_cities;
+        numBlocks = (totalThreads + threadsPerBlock - 1) / threadsPerBlock;
+
+        cout << "Processing batch starting from " << start_source << " (batch size: " << current_batch_size << ")..." << endl;
+        // This goes inside the for loop before launching batchDijkstraKernel
+        computePathLengthsKernel<<<numBlocks, threadsPerBlock>>>(d_paths, d_path_lengths, num_cities, start_source, current_batch_size);
+        cudaDeviceSynchronize();
+    }
+
+    // Copy results back to host
+    cudaMemcpy(flatDistances, d_distances, num_cities * num_cities * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(flatPaths, d_paths, num_cities * num_cities * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(pathLengths, d_path_lengths, num_cities * num_cities * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Convert flat distances to 2D vector
+    for (int i = 0; i < num_cities; i++)
+    {
+        for (int j = 0; j < num_cities; j++)
+        {
+            distances[i][j] = flatDistances[i * num_cities + j];
+        }
+    }
+    cout << "Shortest paths computation complete." << endl;
+    // This goes right before returning from computeShortestPathsCuda
+    // Only reconstruct paths that are needed (between populated cities and shelters)
+    // to save memory
+    for (int source : populatedCities)
+    {
+        vector<int> destinations = shelterCities;                                                // Start with shelters
+        destinations.insert(destinations.end(), populatedCities.begin(), populatedCities.end()); // Add populated cities
+
+        for (int dest : destinations)
+        {
+            if (source == dest)
+            {
+                shortestPaths[source][dest] = {source}; // Path to self
+                continue;
+            }
+
+            int pathLength = pathLengths[source * num_cities + dest];
+            if (pathLength == 0)
+            {
+                // No path exists
+                shortestPaths[source][dest].clear();
+                continue;
+            }
+
+            // Reconstruct path by following predecessors
+            vector<int> path(pathLength);
+            int current = dest;
+            int idx = pathLength - 1;
+
+            while (current != source)
+            {
+                path[idx--] = current;
+                current = flatPaths[source * num_cities + current];
+            }
+            path[0] = source;
+
+            shortestPaths[source][dest] = path;
+        }
+    }
+
+    // Free device memory
+    cudaFree(d_graph);
+    cudaFree(d_distances);
+    cudaFree(d_paths);
+    cudaFree(d_path_lengths);
+
+    // Free host memory
+    delete[] graphMatrix;
+    delete[] flatDistances;
+    delete[] flatPaths;
+    delete[] pathLengths;
 }
 
 // CUDA kernel for parallel shelter evaluation
@@ -224,7 +392,7 @@ __global__ void evaluateSheltersKernel(
         return;
     }
 
-    int dist = d_distances[shelterCity];
+    int dist = d_distances[sourceCity * num_cities + shelterCity];
 
     // Skip if distance exceeds elderly limit and we're checking for elderly
     if (forElderly && dist > max_distance_elderly)
@@ -247,219 +415,6 @@ __global__ void evaluateSheltersKernel(
     float score = peopleSaved / (1.0f + 0.1f * dist);
 
     d_scores[tid] = score;
-}
-
-// Convert adjacency list to adjacency matrix for CUDA
-int *createGraphMatrix(const vector<vector<Road>> &adjacencyList, int num_cities)
-{
-    int *matrix = new int[num_cities * num_cities];
-
-    // Initialize all to 0 (no connection)
-    memset(matrix, 0, num_cities * num_cities * sizeof(int));
-
-    // Fill in the matrix with road lengths
-    for (int i = 0; i < num_cities; i++)
-    {
-        for (const Road &road : adjacencyList[i])
-        {
-            matrix[i * num_cities + road.to] = road.length;
-        }
-    }
-
-    return matrix;
-}
-
-// Compute shortest paths using CUDA
-void computeShortestPathsCuda(
-    const vector<vector<Road>> &adjacencyList,
-    vector<vector<int>> &distances,
-    vector<vector<vector<int>>> &shortestPaths,
-    int num_cities)
-{
-
-    // Choose approach based on number of cities
-    bool smallDataset = (num_cities <= 1000);
-
-    // Convert adjacency list to matrix
-    int *graphMatrix = createGraphMatrix(adjacencyList, num_cities);
-
-    // Flattened arrays for distances and paths
-    int *flatDistances = new int[num_cities * num_cities];
-    int *flatPaths = new int[num_cities * num_cities];
-
-    // Initialize on host first
-    for (int i = 0; i < num_cities; i++)
-    {
-        for (int j = 0; j < num_cities; j++)
-        {
-            if (i == j)
-            {
-                flatDistances[i * num_cities + j] = 0;
-            }
-            else
-            {
-                flatDistances[i * num_cities + j] = INT_MAX;
-            }
-            flatPaths[i * num_cities + j] = -1;
-        }
-    }
-
-    // Device memory
-    int *d_graph, *d_distances, *d_paths;
-
-    // Allocate device memory
-    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_graph, num_cities * num_cities * sizeof(int)));
-    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_distances, num_cities * num_cities * sizeof(int)));
-    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_paths, num_cities * num_cities * sizeof(int)));
-
-    // Copy data to device
-    CHECK_CUDA_ERROR(cudaMemcpy(d_graph, graphMatrix, num_cities * num_cities * sizeof(int), cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_distances, flatDistances, num_cities * num_cities * sizeof(int), cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_paths, flatPaths, num_cities * num_cities * sizeof(int), cudaMemcpyHostToDevice));
-
-    if (smallDataset)
-    {
-        // For small datasets, run all sources in parallel
-        parallelDijkstraKernel<<<num_cities, 1>>>(d_graph, d_distances, d_paths, num_cities);
-        CHECK_CUDA_ERROR(cudaDeviceSynchronize());
-    }
-    else
-    {
-        // For large datasets, process in batches
-        const int BATCH_SIZE = 256;
-        for (int start = 0; start < num_cities; start += BATCH_SIZE)
-        {
-            int batchSize = min(BATCH_SIZE, num_cities - start);
-            parallelDijkstraKernel<<<batchSize, 1>>>(d_graph, d_distances, d_paths, num_cities);
-            CHECK_CUDA_ERROR(cudaDeviceSynchronize());
-        }
-    }
-
-    // Copy results back
-    CHECK_CUDA_ERROR(cudaMemcpy(flatDistances, d_distances, num_cities * num_cities * sizeof(int), cudaMemcpyDeviceToHost));
-    CHECK_CUDA_ERROR(cudaMemcpy(flatPaths, d_paths, num_cities * num_cities * sizeof(int), cudaMemcpyDeviceToHost));
-
-    // Reconstruct paths
-    if (smallDataset)
-    {
-        // We'll reconstruct all paths for small datasets
-        int max_path_length = num_cities;
-        int *flatReconstructedPaths = new int[num_cities * num_cities * max_path_length];
-        int *pathLengths = new int[num_cities * num_cities];
-
-        // Initialize path lengths
-        memset(pathLengths, 0, num_cities * num_cities * sizeof(int));
-
-        int *d_reconstructed_paths, *d_path_lengths;
-        CHECK_CUDA_ERROR(cudaMalloc((void **)&d_reconstructed_paths, num_cities * num_cities * max_path_length * sizeof(int)));
-        CHECK_CUDA_ERROR(cudaMalloc((void **)&d_path_lengths, num_cities * num_cities * sizeof(int)));
-
-        CHECK_CUDA_ERROR(cudaMemcpy(d_path_lengths, pathLengths, num_cities * num_cities * sizeof(int), cudaMemcpyHostToDevice));
-
-        // Launch kernel for path reconstruction
-        pathReconstructionKernel<<<num_cities, num_cities>>>(d_paths, d_reconstructed_paths, d_path_lengths, num_cities, max_path_length);
-        CHECK_CUDA_ERROR(cudaDeviceSynchronize());
-
-        // Copy results back
-        CHECK_CUDA_ERROR(cudaMemcpy(pathLengths, d_path_lengths, num_cities * num_cities * sizeof(int), cudaMemcpyDeviceToHost));
-        CHECK_CUDA_ERROR(cudaMemcpy(flatReconstructedPaths, d_reconstructed_paths, num_cities * num_cities * max_path_length * sizeof(int), cudaMemcpyDeviceToHost));
-
-        // Convert to output format
-        for (int i = 0; i < num_cities; i++)
-        {
-            for (int j = 0; j < num_cities; j++)
-            {
-                int pathLength = pathLengths[i * num_cities + j];
-
-                if (pathLength > 0)
-                {
-                    shortestPaths[i][j].resize(pathLength);
-                    for (int k = 0; k < pathLength; k++)
-                    {
-                        shortestPaths[i][j][k] = flatReconstructedPaths[(i * num_cities + j) * max_path_length + k];
-                    }
-                }
-                else
-                {
-                    shortestPaths[i][j].clear();
-                }
-            }
-        }
-
-        // Free additional memory
-        CHECK_CUDA_ERROR(cudaFree(d_reconstructed_paths));
-        CHECK_CUDA_ERROR(cudaFree(d_path_lengths));
-        delete[] flatReconstructedPaths;
-        delete[] pathLengths;
-    }
-    else
-    {
-        for (int i = 0; i < num_cities; i++)
-        {
-            for (int j = 0; j < num_cities; j++)
-            {
-                // Skip self-paths
-                if (i == j)
-                {
-                    shortestPaths[i][j] = {i};
-                    continue;
-                }
-
-                // Check if a path exists
-                if (flatDistances[i * num_cities + j] == INT_MAX || flatPaths[i * num_cities + j] == -1)
-                {
-                    shortestPaths[i][j].clear();
-                    continue;
-                }
-
-                // Reconstruct the path
-                vector<int> path;
-                int current = j;
-
-                // Follow predecessors to reconstruct the path
-                while (current != i)
-                {
-                    path.push_back(current);
-                    current = flatPaths[i * num_cities + current];
-
-                    // Safety check for cycles
-                    if (path.size() >= num_cities)
-                    {
-                        path.clear();
-                        break;
-                    }
-                }
-
-                if (!path.empty())
-                {
-                    path.push_back(i);
-                    reverse(path.begin(), path.end());
-                    shortestPaths[i][j] = path;
-                }
-                else
-                {
-                    shortestPaths[i][j].clear();
-                }
-            }
-        }
-    }
-
-    // Convert to output distances
-    for (int i = 0; i < num_cities; i++)
-    {
-        for (int j = 0; j < num_cities; j++)
-        {
-            distances[i][j] = flatDistances[i * num_cities + j];
-        }
-    }
-
-    // Free memory
-    CHECK_CUDA_ERROR(cudaFree(d_graph));
-    CHECK_CUDA_ERROR(cudaFree(d_distances));
-    CHECK_CUDA_ERROR(cudaFree(d_paths));
-    delete[] graphMatrix;
-    delete[] flatDistances;
-    delete[] flatPaths;
 }
 
 // Parallel shelter evaluation wrapper
@@ -490,9 +445,10 @@ vector<pair<int, double>> evaluateShelters(
         h_shelterCapacities[i] = shelterCapacity.at(shelterCities[i]);
     }
 
-    // Get distances from source city to all other cities
+    // Flatten distance matrix for just the required row
     int num_cities = distances.size();
     int *h_distancesRow = new int[num_cities];
+
     for (int j = 0; j < num_cities; j++)
     {
         h_distancesRow[j] = distances[sourceCity][j];
@@ -502,27 +458,27 @@ vector<pair<int, double>> evaluateShelters(
     int *d_shelterCities, *d_shelterCapacities, *d_distancesRow;
     float *d_scores;
 
-    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_shelterCities, num_shelters * sizeof(int)));
-    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_shelterCapacities, num_shelters * sizeof(int)));
-    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_distancesRow, num_cities * sizeof(int)));
-    CHECK_CUDA_ERROR(cudaMalloc((void **)&d_scores, num_shelters * sizeof(float)));
+    cudaMalloc((void **)&d_shelterCities, num_shelters * sizeof(int));
+    cudaMalloc((void **)&d_shelterCapacities, num_shelters * sizeof(int));
+    cudaMalloc((void **)&d_distancesRow, num_cities * sizeof(int));
+    cudaMalloc((void **)&d_scores, num_shelters * sizeof(float));
 
     // Copy data to GPU
-    CHECK_CUDA_ERROR(cudaMemcpy(d_shelterCities, h_shelterCities, num_shelters * sizeof(int), cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_shelterCapacities, h_shelterCapacities, num_shelters * sizeof(int), cudaMemcpyHostToDevice));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_distancesRow, h_distancesRow, num_cities * sizeof(int), cudaMemcpyHostToDevice));
+    cudaMemcpy(d_shelterCities, h_shelterCities, num_shelters * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_shelterCapacities, h_shelterCapacities, num_shelters * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_distancesRow, h_distancesRow, num_cities * sizeof(int), cudaMemcpyHostToDevice);
 
     // Launch kernel
     int blockSize = 256;
     int numBlocks = (num_shelters + blockSize - 1) / blockSize;
 
+    // Modified kernel call that only needs the single row of distances
     evaluateSheltersKernel<<<numBlocks, blockSize>>>(
         d_shelterCities, d_shelterCapacities, d_distancesRow, d_scores,
         sourceCity, peopleToEvacuate, num_shelters, max_distance_elderly, forElderly, num_cities);
-    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
 
     // Get results
-    CHECK_CUDA_ERROR(cudaMemcpy(h_scores, d_scores, num_shelters * sizeof(float), cudaMemcpyDeviceToHost));
+    cudaMemcpy(h_scores, d_scores, num_shelters * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Create result vector
     vector<pair<int, double>> shelterScores;
@@ -547,15 +503,15 @@ vector<pair<int, double>> evaluateShelters(
     delete[] h_scores;
     delete[] h_distancesRow;
 
-    CHECK_CUDA_ERROR(cudaFree(d_shelterCities));
-    CHECK_CUDA_ERROR(cudaFree(d_shelterCapacities));
-    CHECK_CUDA_ERROR(cudaFree(d_distancesRow));
-    CHECK_CUDA_ERROR(cudaFree(d_scores));
+    cudaFree(d_shelterCities);
+    cudaFree(d_shelterCapacities);
+    cudaFree(d_distancesRow);
+    cudaFree(d_scores);
 
     return shelterScores;
 }
 
-// Calculate traversal time
+// Road traversal time calculation
 double calculateTraversalTime(int numPeople, int roadCapacity, int roadLength)
 {
     // Speed is 5 km/h
@@ -564,7 +520,7 @@ double calculateTraversalTime(int numPeople, int roadCapacity, int roadLength)
     return timePerBatch * numBatches;
 }
 
-// Generate evacuation paths
+// Generate evacuation paths for all populated cities
 void generateEvacuationPaths(
     int num_cities,
     const vector<vector<Road>> &adjacencyList,
@@ -581,120 +537,14 @@ void generateEvacuationPaths(
     long long ***drops,
     int num_populated_cities)
 {
-
-    // Set timeout for large datasets
-    auto startTime = chrono::high_resolution_clock::now();
-    const int TIMEOUT_SECONDS = 590; // 9 minutes 50 seconds timeout
+    // Add timeout tracking
 
     // For each populated city
     for (int i = 0; i < num_populated_cities; i++)
     {
         // Check for timeout
-        auto currentTime = chrono::high_resolution_clock::now();
-        auto elapsedSeconds = chrono::duration_cast<chrono::seconds>(currentTime - startTime).count();
 
-        if (elapsedSeconds > TIMEOUT_SECONDS)
-        {
-            // For remaining cities, use a simplified evacuation strategy
-            for (int j = i; j < num_populated_cities; j++)
-            {
-                int sourceCity = populatedCities[j];
-                int prime_age = populatedCityInfo.at(sourceCity).first;
-                int elderly = populatedCityInfo.at(sourceCity).second;
-
-                // Simplified evacuation: find closest shelter with capacity
-                vector<pair<int, double>> shelters = evaluateShelters(
-                    sourceCity, prime_age + elderly, shelterCities, shelterCapacity,
-                    distances, max_distance_elderly, false);
-
-                vector<int> evacPath;
-                vector<vector<long long>> evacDrops;
-
-                // Start with source city
-                evacPath.push_back(sourceCity);
-
-                if (shelters.empty())
-                {
-                    // No available shelter, drop everyone at source
-                    evacDrops.push_back({(long long)sourceCity, (long long)prime_age, (long long)elderly});
-                }
-                else
-                {
-                    int targetShelter = shelters[0].first;
-
-                    // Check if elderly can reach the shelter
-                    bool elderlyCanReach = (distances[sourceCity][targetShelter] <= max_distance_elderly);
-
-                    // If elderly can't reach, drop them at source
-                    if (!elderlyCanReach && elderly > 0)
-                    {
-                        evacDrops.push_back({(long long)sourceCity, 0, (long long)elderly});
-                        elderly = 0;
-                    }
-
-                    // Add path to shelter
-                    const vector<int> &pathToShelter = shortestPaths[sourceCity][targetShelter];
-                    if (!pathToShelter.empty())
-                    {
-                        for (int k = 1; k < pathToShelter.size(); k++)
-                        {
-                            evacPath.push_back(pathToShelter[k]);
-                        }
-
-                        // Drop remaining people at shelter
-                        int capacity = shelterCapacity[targetShelter];
-                        int elderlyToDrop = min(elderly, capacity);
-                        capacity -= elderlyToDrop;
-                        elderly -= elderlyToDrop;
-
-                        int primeToDrop = min(prime_age, capacity);
-                        capacity -= primeToDrop;
-                        prime_age -= primeToDrop;
-
-                        shelterCapacity[targetShelter] -= (elderlyToDrop + primeToDrop);
-
-                        if (elderlyToDrop > 0 || primeToDrop > 0)
-                        {
-                            evacDrops.push_back({(long long)targetShelter, (long long)primeToDrop, (long long)elderlyToDrop});
-                        }
-
-                        // If anyone remains, drop at the shelter city (they won't be saved)
-                        if (prime_age > 0 || elderly > 0)
-                        {
-                            evacDrops.push_back({(long long)targetShelter, (long long)prime_age, (long long)elderly});
-                        }
-                    }
-                    else
-                    {
-                        // No path to shelter, drop everyone at source
-                        evacDrops.push_back({(long long)sourceCity, (long long)prime_age, (long long)elderly});
-                    }
-                }
-
-                // Set path and drops
-                path_size[j] = evacPath.size();
-                paths[j] = new long long[evacPath.size()];
-                for (int k = 0; k < evacPath.size(); k++)
-                {
-                    paths[j][k] = evacPath[k];
-                }
-
-                num_drops[j] = evacDrops.size();
-                drops[j] = new long long *[evacDrops.size()];
-                for (int k = 0; k < evacDrops.size(); k++)
-                {
-                    drops[j][k] = new long long[3];
-                    drops[j][k][0] = evacDrops[k][0]; // City
-                    drops[j][k][1] = evacDrops[k][1]; // Prime age
-                    drops[j][k][2] = evacDrops[k][2]; // Elderly
-                }
-            }
-
-            // Skip the normal processing
-            return;
-        }
-
-        int sourceCity = populatedCities[i];
+                int sourceCity = populatedCities[i];
         int prime_age = populatedCityInfo.at(sourceCity).first;
         int elderly = populatedCityInfo.at(sourceCity).second;
 
@@ -705,6 +555,8 @@ void generateEvacuationPaths(
         evacPath.push_back(sourceCity);
         int currentCity = sourceCity;
         int distanceTraveled = 0;
+
+        cout << "Processing evacuation for city " << sourceCity << " (" << i + 1 << "/" << num_populated_cities << ")..." << endl;
 
         // Check if source city is a shelter
         if (shelterCapacity.find(sourceCity) != shelterCapacity.end() && shelterCapacity[sourceCity] > 0)
@@ -732,12 +584,15 @@ void generateEvacuationPaths(
         }
 
         // Add iteration counter to prevent infinite loops
-        int maxIterations = min(100, num_cities * 2); // Adjust based on graph size
+        int maxIterations = 100; // Adjust based on expected complexity
         int iterationCount = 0;
 
         // Continue evacuation until all people are dropped
         while ((prime_age > 0 || elderly > 0) && iterationCount++ < maxIterations)
         {
+            // Debug output for shelter evaluation
+            cout << "  Evaluating shelters from city " << currentCity << " (prime: " << prime_age << ", elderly: " << elderly << ")" << endl;
+
             // First handle elderly (they have distance restrictions)
             int nextShelterForElderly = -1;
             auto elderlyShelters = evaluateShelters(
@@ -760,7 +615,11 @@ void generateEvacuationPaths(
             int nextShelterForPrime = -1;
             auto primeShelters = evaluateShelters(
                 currentCity, prime_age, shelterCities, shelterCapacity,
-                distances, INT_MAX, false);
+                distances, max_distance_elderly, false);
+
+            // Debug output for shelter evaluation results
+            cout << "  Found " << elderlyShelters.size() << " shelters for elderly, "
+                 << primeShelters.size() << " shelters for prime-age" << endl;
 
             if (prime_age > 0 && !primeShelters.empty())
             {
@@ -790,7 +649,7 @@ void generateEvacuationPaths(
             // Check for empty paths
             if (pathToShelter.empty() || startIdx >= pathToShelter.size())
             {
-                // No path to shelter found, drop everyone at current city
+                cout << "  WARNING: Empty path to shelter " << targetShelter << ". Dropping population at current city." << endl;
                 if (elderly > 0)
                 {
                     evacDrops.push_back({(long long)currentCity, 0, (long long)elderly});
@@ -805,7 +664,7 @@ void generateEvacuationPaths(
             }
 
             // Add maximum path length safeguard
-            const int MAX_PATH_LENGTH = min(1000, num_cities * 2); // Adjust based on graph size
+            const int MAX_PATH_LENGTH = 1000; // Adjust as needed
             bool pathTooLong = false;
 
             // Travel along the path to the shelter
@@ -814,11 +673,15 @@ void generateEvacuationPaths(
                 // Check if the path is getting too long
                 if (evacPath.size() >= MAX_PATH_LENGTH)
                 {
+                    cout << "  WARNING: Path length exceeds maximum allowed. Dropping remaining population." << endl;
                     pathTooLong = true;
                     break;
                 }
 
                 int nextCity = pathToShelter[j];
+
+                // Debug output for city traversal
+                cout << "  Moving to city " << nextCity << " (distance so far: " << distanceTraveled << ")" << endl;
 
                 // Calculate distance to next city
                 int addedDistance = 0;
@@ -880,7 +743,7 @@ void generateEvacuationPaths(
                 }
             }
 
-            // If path was too long, drop remaining population at current city
+            // If path was too long, drop remaining population
             if (pathTooLong)
             {
                 if (elderly > 0)
@@ -900,6 +763,7 @@ void generateEvacuationPaths(
         // Handle case where we hit the maximum iterations
         if (iterationCount >= maxIterations)
         {
+            cout << "WARNING: Maximum iterations reached for city " << sourceCity << ". Dropping remaining population." << endl;
             // Drop any remaining population at current city
             if (elderly > 0)
             {
@@ -935,7 +799,6 @@ void generateEvacuationPaths(
         }
     }
 }
-
 int main(int argc, char *argv[])
 {
     if (argc < 3)
@@ -944,11 +807,8 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Start timing
-    auto startTime = chrono::high_resolution_clock::now();
-
-    // Read input file
-    ifstream infile(argv[1]);
+    //--------------input--------------------------------
+    ifstream infile(argv[1]); // Read input file from command-line argument
     if (!infile)
     {
         cerr << "Error: Cannot open file " << argv[1] << "\n";
@@ -957,14 +817,15 @@ int main(int argc, char *argv[])
 
     long long num_cities;
     infile >> num_cities;
-    cout << "Number of cities: " << num_cities << endl;
+    cout << "num cities = " << num_cities << endl;
 
     long long num_roads;
     infile >> num_roads;
-    cout << "Number of roads: " << num_roads << endl;
+    cout << "num roads = " << num_roads << endl;
 
-    // Store roads as a flat array
+    // Store roads as a flat array: [u1, v1, length1, capacity1, u2, v2, length2, capacity2, ...]
     int *roads = new int[num_roads * 4];
+
     for (int i = 0; i < num_roads; i++)
     {
         infile >> roads[4 * i] >> roads[4 * i + 1] >> roads[4 * i + 2] >> roads[4 * i + 3];
@@ -972,11 +833,12 @@ int main(int argc, char *argv[])
 
     int num_shelters;
     infile >> num_shelters;
-    cout << "Number of shelters: " << num_shelters << endl;
+    cout << "num shelters = " << num_shelters << endl;
 
-    // Store shelters
+    // Store shelters separately
     long long *shelter_city = new long long[num_shelters];
     long long *shelter_capacity = new long long[num_shelters];
+
     for (int i = 0; i < num_shelters; i++)
     {
         infile >> shelter_city[i] >> shelter_capacity[i];
@@ -984,11 +846,12 @@ int main(int argc, char *argv[])
 
     int num_populated_cities;
     infile >> num_populated_cities;
-    cout << "Number of populated cities: " << num_populated_cities << endl;
+    cout << "num pop cities = " << num_populated_cities << endl;
 
-    // Store populated cities
+    // Store populated cities separately
     long long *city = new long long[num_populated_cities];
-    long long *pop = new long long[num_populated_cities * 2]; // [prime-age, elderly] pairs
+    long long *pop = new long long[num_populated_cities * 2]; // Flattened [prime-age, elderly] pairs
+
     for (long long i = 0; i < num_populated_cities; i++)
     {
         infile >> city[i] >> pop[2 * i] >> pop[2 * i + 1];
@@ -996,8 +859,14 @@ int main(int argc, char *argv[])
 
     int max_distance_elderly;
     infile >> max_distance_elderly;
-    cout << "Max distance for elderly: " << max_distance_elderly << endl;
+    cout << "max dist elderly= " << max_distance_elderly << endl;
+
     infile.close();
+
+    //-------------------------end of input----------
+
+    cout << "Input loaded. Starting preprocessing..." << endl;
+    // This goes right after: infile.close();
 
     // Build adjacency list from roads array
     vector<vector<Road>> adjacencyList(num_cities);
@@ -1038,26 +907,32 @@ int main(int argc, char *argv[])
     }
 
     // Initialize distances and paths
+    // Only allocate for the needed cities to save memory
     vector<vector<int>> distances(num_cities, vector<int>(num_cities, INT_MAX));
     vector<vector<vector<int>>> shortestPaths(num_cities, vector<vector<int>>(num_cities));
 
-    // Compute shortest paths using CUDA
-    computeShortestPathsCuda(adjacencyList, distances, shortestPaths, num_cities);
+    // Compute shortest paths using CUDA with memory optimizations
+    cout << "Starting shortest path computation for " << num_cities << " cities and " << num_roads << " roads..." << endl;
+    // This goes right before: computeShortestPathsCuda(...) call
+    computeShortestPathsCuda(adjacencyList, distances, shortestPaths, num_cities, populatedCities, shelterCities);
 
-    // Set answer variables
+    // set your answer to these variables
     long long *path_size = new long long[num_populated_cities];
     long long **paths = new long long *[num_populated_cities];
     long long *num_drops = new long long[num_populated_cities];
     long long ***drops = new long long **[num_populated_cities];
 
     // Generate evacuation paths
+    cout << "Generating evacuation paths for " << num_populated_cities << " populated cities..." << endl;
+    // This goes before calling generateEvacuationPaths
     generateEvacuationPaths(
         num_cities, adjacencyList, populatedCities, populatedCityInfo,
         shelterCities, shelterCapacity, distances, shortestPaths,
         max_distance_elderly, path_size, paths, num_drops, drops, num_populated_cities);
 
-    // Write output
-    ofstream outfile(argv[2]);
+    //------------output-----------------
+
+    ofstream outfile(argv[2]); // Output file from command-line argument
     if (!outfile)
     {
         cerr << "Error: Cannot open file " << argv[2] << "\n";
@@ -1108,11 +983,6 @@ int main(int argc, char *argv[])
     delete[] paths;
     delete[] num_drops;
     delete[] drops;
-
-    // Print execution time
-    auto endTime = chrono::high_resolution_clock::now();
-    auto duration = chrono::duration_cast<chrono::milliseconds>(endTime - startTime).count();
-    cout << "Total execution time: " << duration / 1000.0 << " seconds" << endl;
 
     return 0;
 }
