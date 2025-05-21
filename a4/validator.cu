@@ -1,4 +1,4 @@
-//% % writefile validator.cu
+// %%writefile validator.cpp
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <limits>
+#include <climits>
 #include <sstream>
 #include <string>
 
@@ -92,7 +93,6 @@ private:
     // Validation flags
     bool pathsValid = true;
     bool dropsValid = true;
-    bool capacityValid = true;
     bool elderlyDistanceValid = true;
 
 public:
@@ -247,7 +247,7 @@ public:
         return pathsValid;
     }
 
-    // Validate drops
+    // Validate drops with updated penalty calculation
     bool validateDrops()
     {
         vector<int> cityPrimeEvacuated(num_cities, 0);
@@ -299,28 +299,60 @@ public:
             }
         }
 
-        // Validate shelter capacities
+        // Reset saved and dropped counts
+        savedPrime = 0;
+        savedElderly = 0;
+        droppedPrime = 0;
+        droppedElderly = 0;
+
+        // Validate shelter capacities and apply penalty
         for (int city = 0; city < num_cities; city++)
         {
             if (cities[city].isShelter)
             {
+                int capacity = cities[city].initialCapacity;
                 int totalDropped = cityPrimeEvacuated[city] + cityElderlyEvacuated[city];
-                if (totalDropped > cities[city].initialCapacity)
+
+                // Calculate excess and apply penalty according to PDF rules
+                int excess = max(0, totalDropped - capacity);
+
+                // Penalty is same as excess, but capped by capacity
+                int penalty = min(excess, capacity);
+
+                // Actual saved = totalDropped - excess - penalty
+                int actualSaved = totalDropped - excess - penalty;
+
+                // Split saved between prime and elderly proportionally
+                if (totalDropped > 0)
                 {
-                    cerr << "Error: Shelter at city " << city << " is over capacity\n";
-                    cerr << "  Capacity: " << cities[city].initialCapacity << "\n";
-                    cerr << "  Dropped: " << totalDropped << " (Prime: " << cityPrimeEvacuated[city]
-                         << ", Elderly: " << cityElderlyEvacuated[city] << ")\n";
-                    capacityValid = false;
+                    float primeProportion = (float)cityPrimeEvacuated[city] / totalDropped;
+                    float elderlyProportion = (float)cityElderlyEvacuated[city] / totalDropped;
+
+                    int savedPrimeHere = round(actualSaved * primeProportion);
+                    int savedElderlyHere = actualSaved - savedPrimeHere; // Ensure total adds up exactly
+
+                    savedPrime += savedPrimeHere;
+                    savedElderly += savedElderlyHere;
+
+                    // Update dropped counts (those not saved)
+                    droppedPrime += cityPrimeEvacuated[city] - savedPrimeHere;
+                    droppedElderly += cityElderlyEvacuated[city] - savedElderlyHere;
                 }
 
-                // Count saved people
-                savedPrime += cityPrimeEvacuated[city];
-                savedElderly += cityElderlyEvacuated[city];
+                // For validation purposes, log if shelter is over capacity, but don't mark as error
+                if (totalDropped > capacity)
+                {
+                    cerr << "Note: Shelter at city " << city << " is over capacity\n";
+                    cerr << "  Capacity: " << capacity << "\n";
+                    cerr << "  Dropped: " << totalDropped << " (Prime: " << cityPrimeEvacuated[city]
+                         << ", Elderly: " << cityElderlyEvacuated[city] << ")\n";
+                    cerr << "  Excess: " << excess << ", Penalty: " << penalty << "\n";
+                    cerr << "  Saved: " << actualSaved << " people\n";
+                }
             }
             else
             {
-                // Count dropped people
+                // For non-shelter cities, all dropped people count as "dropped" (not saved)
                 droppedPrime += cityPrimeEvacuated[city];
                 droppedElderly += cityElderlyEvacuated[city];
             }
@@ -329,7 +361,7 @@ public:
         totalSaved = savedPrime + savedElderly;
         totalDropped = droppedPrime + droppedElderly;
 
-        return dropsValid && capacityValid;
+        return dropsValid;
     }
 
     // Validate elderly distance constraints
@@ -340,36 +372,46 @@ public:
             int originCity = populatedCities[i];
             const vector<int> &path = inputPaths[i];
 
-            // Calculate distance from origin to each city in path
-            vector<int> distanceFromOrigin(num_cities, INT_MAX);
-            distanceFromOrigin[originCity] = 0;
+            // FIXED: Calculate distance for each position in the path
+            vector<int> pathPositionDistance(path.size(), 0);
 
-            for (size_t j = 0; j < path.size() - 1; j++)
+            // Calculate cumulative distance along the path
+            for (size_t j = 1; j < path.size(); j++)
             {
-                int u = path[j];
-                int v = path[j + 1];
+                int u = path[j - 1];
+                int v = path[j];
 
                 if (roadMap.find({u, v}) != roadMap.end())
                 {
                     int roadLength = roadMap[{u, v}].length;
-                    distanceFromOrigin[v] = distanceFromOrigin[u] + roadLength;
+                    pathPositionDistance[j] = pathPositionDistance[j - 1] + roadLength;
                 }
             }
 
-            // Check if elderly are dropped within max distance
-            for (const Drop &drop : inputDrops[i])
+            // Match drops to path positions and check distances
+            size_t dropIndex = 0;
+            for (size_t pathIdx = 0; pathIdx < path.size() && dropIndex < inputDrops[i].size(); pathIdx++)
             {
-                if (drop.elderly > 0)
+                int currentCity = path[pathIdx];
+
+                // Check if this position matches a drop city
+                while (dropIndex < inputDrops[i].size() && inputDrops[i][dropIndex].city == currentCity)
                 {
-                    int dropDistance = distanceFromOrigin[drop.city];
-                    if (dropDistance > max_distance_elderly)
+                    const Drop &drop = inputDrops[i][dropIndex];
+
+                    if (drop.elderly > 0)
                     {
-                        cerr << "Error: Elderly from city " << originCity
-                             << " dropped at city " << drop.city
-                             << " which is " << dropDistance
-                             << " distance away (max allowed: " << max_distance_elderly << ")\n";
-                        elderlyDistanceValid = false;
+                        int dropDistance = pathPositionDistance[pathIdx];
+                        if (dropDistance > max_distance_elderly)
+                        {
+                            cerr << "Error: Elderly from city " << originCity
+                                 << " dropped at city " << drop.city
+                                 << " which is " << dropDistance
+                                 << " distance away (max allowed: " << max_distance_elderly << ")\n";
+                            elderlyDistanceValid = false;
+                        }
                     }
+                    dropIndex++;
                 }
             }
         }
@@ -477,13 +519,13 @@ public:
         bool elderlyValid = validateElderlyDistance();
         simulateEvacuation();
 
-        return pathsValid && dropsValid && elderlyValid && capacityValid;
+        return pathsValid && dropsValid && elderlyValid;
     }
 
     // Overall validation status
     bool isValid() const
     {
-        return pathsValid && dropsValid && capacityValid && elderlyDistanceValid;
+        return pathsValid && dropsValid && elderlyDistanceValid;
     }
 };
 
